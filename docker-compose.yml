@@ -1,0 +1,31 @@
+services:
+  service-a:
+    build:
+      context: ./service-a
+    ports:
+      - "8080:8080"
+    depends_on:
+      - service-b
+    networks:
+      - mynetwork
+
+  service-b:
+    build:
+      context: ./service-b
+    environment:
+      - WEATHER_API_KEY=34d63294876549b785b52344242507
+    depends_on:
+      - zipkin
+    networks:
+      - mynetwork
+
+  zipkin:
+    image: openzipkin/zipkin
+    ports:
+      - "9411:9411"
+    networks:
+      - mynetwork
+
+networks:
+  mynetwork:
+    driver: bridge
