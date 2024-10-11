@@ -4,12 +4,12 @@ import (
     "context"
     "encoding/json"
     "fmt"
-    "io/ioutil"
+    "io"
     "log"
     "net/http"
+    "net/url"
     "os"
     "regexp"
-    "time"
 
     "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
     "go.opentelemetry.io/otel"
@@ -17,6 +17,7 @@ import (
     "go.opentelemetry.io/otel/sdk/resource"
     sdktrace "go.opentelemetry.io/otel/sdk/trace"
     "go.opentelemetry.io/otel/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 )
 
 var tracer trace.Tracer
@@ -31,10 +32,12 @@ func initTracer() {
 
     tp := sdktrace.NewTracerProvider(
         sdktrace.WithBatcher(exporter),
-        sdktrace.WithResource(resource.Default()),
+        sdktrace.WithResource(resource.NewSchemaless(
+            semconv.ServiceNameKey.String("service-B"),
+        )),
     )
     otel.SetTracerProvider(tp)
-    tracer = tp.Tracer("service-B")
+    tracer = otel.Tracer("service-B")
 }
 
 type CEPRequest struct {
@@ -52,10 +55,10 @@ type WeatherResponse struct {
 }
 
 type FinalResponse struct {
-    City   string  `json:"city"`
-    TempC  float64 `json:"temp_C"`
-    TempF  float64 `json:"temp_F"`
-    TempK  float64 `json:"temp_K"`
+    City  string  `json:"city"`
+    TempC float64 `json:"tempC"`
+    TempF float64 `json:"tempF"`
+    TempK float64 `json:"tempK"`
 }
 
 func validateCEP(cep string) bool {
@@ -67,7 +70,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
     ctx, span := tracer.Start(r.Context(), "Service B - Handler")
     defer span.End()
 
-    body, err := ioutil.ReadAll(r.Body)
+    body, err := io.ReadAll(r.Body)
     if err != nil {
         http.Error(w, "invalid request", http.StatusBadRequest)
         return
@@ -82,14 +85,16 @@ func handler(w http.ResponseWriter, r *http.Request) {
     // Get City Name
     city, err := getCity(ctx, cepRequest.CEP)
     if err != nil {
-        http.Error(w, "can not find zipcode", http.StatusNotFound)
+        log.Println("Error getting city:", err)
+        http.Error(w, "cannot find zipcode", http.StatusNotFound)
         return
     }
 
     // Get Weather
     tempC, err := getWeather(ctx, city)
     if err != nil {
-        http.Error(w, "can not get weather", http.StatusInternalServerError)
+        log.Println("Error getting weather:", err)
+        http.Error(w, fmt.Sprintf("cannot get weather: %v", err), http.StatusInternalServerError)
         return
     }
 
@@ -108,43 +113,84 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getCity(ctx context.Context, cep string) (string, error) {
-    _, span := tracer.Start(ctx, "Get City")
+    ctx, span := tracer.Start(ctx, "Get City")
     defer span.End()
 
-    resp, err := http.Get(fmt.Sprintf("https://viacep.com.br/ws/%s/json/", cep))
+    client := http.Client{
+        Transport: otelhttp.NewTransport(http.DefaultTransport),
+    }
+    url := fmt.Sprintf("https://viacep.com.br/ws/%s/json/", cep)
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
     if err != nil {
+        log.Println("Error creating request to ViaCEP:", err)
+        return "", err
+    }
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Println("Error making request to ViaCEP:", err)
         return "", err
     }
     defer resp.Body.Close()
-    if resp.StatusCode != 200 {
-        return "", fmt.Errorf("CEP not found")
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        log.Printf("ViaCEP returned status %d: %s\n", resp.StatusCode, string(body))
+        return "", fmt.Errorf("ViaCEP returned status %d", resp.StatusCode)
     }
     var cepResp CEPResponse
-    body, _ := ioutil.ReadAll(resp.Body)
-    json.Unmarshal(body, &cepResp)
+    body, _ := io.ReadAll(resp.Body)
+    err = json.Unmarshal(body, &cepResp)
+    if err != nil {
+        log.Println("Error parsing JSON from ViaCEP:", err)
+        return "", err
+    }
     if cepResp.Localidade == "" {
-        return "", fmt.Errorf("CEP not found")
+        log.Println("Localidade not found in ViaCEP response")
+        return "", fmt.Errorf("CEP not found in ViaCEP")
     }
     return cepResp.Localidade, nil
 }
 
 func getWeather(ctx context.Context, city string) (float64, error) {
-    _, span := tracer.Start(ctx, "Get Weather")
+    ctx, span := tracer.Start(ctx, "Get Weather")
     defer span.End()
 
     apiKey := os.Getenv("WEATHER_API_KEY")
-    url := fmt.Sprintf("http://api.weatherapi.com/v1/current.json?key=%s&q=%s&aqi=no", apiKey, city)
-    resp, err := http.Get(url)
+    if apiKey == "" {
+        log.Println("WEATHER_API_KEY is not set")
+        return 0, fmt.Errorf("WEATHER_API_KEY is not set")
+    }
+
+    // URL-encode the city name
+    encodedCity := url.QueryEscape(city)
+    url := fmt.Sprintf("http://api.weatherapi.com/v1/current.json?key=%s&q=%s&aqi=no", apiKey, encodedCity)
+    log.Println("Requesting WeatherAPI with URL:", url)
+
+    client := http.Client{
+        Transport: otelhttp.NewTransport(http.DefaultTransport),
+    }
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
     if err != nil {
+        log.Println("Error creating request to WeatherAPI:", err)
+        return 0, err
+    }
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Println("Error making request to WeatherAPI:", err)
         return 0, err
     }
     defer resp.Body.Close()
-    if resp.StatusCode != 200 {
-        return 0, fmt.Errorf("Weather not found")
+    body, _ := io.ReadAll(resp.Body)
+    if resp.StatusCode != http.StatusOK {
+        log.Printf("WeatherAPI returned status %d: %s\n", resp.StatusCode, string(body))
+        return 0, fmt.Errorf("WeatherAPI error: %s", string(body))
     }
+    log.Println("WeatherAPI response:", string(body))
     var weatherResp WeatherResponse
-    body, _ := ioutil.ReadAll(resp.Body)
-    json.Unmarshal(body, &weatherResp)
+    err = json.Unmarshal(body, &weatherResp)
+    if err != nil {
+        log.Println("Error parsing JSON from WeatherAPI:", err)
+        return 0, err
+    }
     return weatherResp.Current.TempC, nil
 }
 

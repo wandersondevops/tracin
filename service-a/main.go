@@ -1,14 +1,13 @@
 package main
 
 import (
-    "context"
+    "bytes"
     "encoding/json"
-    "io/ioutil"
+    "io"
     "log"
     "net/http"
-    "os"
     "regexp"
-    "time"
+    "strings"
 
     "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
     "go.opentelemetry.io/otel"
@@ -16,6 +15,7 @@ import (
     "go.opentelemetry.io/otel/sdk/resource"
     sdktrace "go.opentelemetry.io/otel/sdk/trace"
     "go.opentelemetry.io/otel/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 )
 
 var tracer trace.Tracer
@@ -30,10 +30,12 @@ func initTracer() {
 
     tp := sdktrace.NewTracerProvider(
         sdktrace.WithBatcher(exporter),
-        sdktrace.WithResource(resource.Default()),
+        sdktrace.WithResource(resource.NewSchemaless(
+            semconv.ServiceNameKey.String("service-A"),
+        )),
     )
     otel.SetTracerProvider(tp)
-    tracer = tp.Tracer("service-A")
+    tracer = otel.Tracer("service-A")
 }
 
 type CEPRequest struct {
@@ -41,6 +43,8 @@ type CEPRequest struct {
 }
 
 func validateCEP(cep string) bool {
+    // Remove any hyphens before validation
+    cep = strings.ReplaceAll(cep, "-", "")
     re := regexp.MustCompile(`^\d{8}$`)
     return re.MatchString(cep)
 }
@@ -49,14 +53,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
     ctx, span := tracer.Start(r.Context(), "Service A - Handler")
     defer span.End()
 
-    body, err := ioutil.ReadAll(r.Body)
+    body, err := io.ReadAll(r.Body)
     if err != nil {
         http.Error(w, "invalid request", http.StatusBadRequest)
         return
     }
     var cepRequest CEPRequest
     err = json.Unmarshal(body, &cepRequest)
-    if err != nil || !validateCEP(cepRequest.CEP) {
+    if err != nil {
+        http.Error(w, "invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    // Normalize and validate CEP
+    cepRequest.CEP = strings.ReplaceAll(cepRequest.CEP, "-", "")
+    if !validateCEP(cepRequest.CEP) {
         http.Error(w, "invalid zipcode", http.StatusUnprocessableEntity)
         return
     }
@@ -66,21 +77,22 @@ func handler(w http.ResponseWriter, r *http.Request) {
         Transport: otelhttp.NewTransport(http.DefaultTransport),
     }
     reqBody, _ := json.Marshal(cepRequest)
-    req, err := http.NewRequestWithContext(ctx, "POST", "http://service-b:8081/cep", ioutil.NopCloser(r.Body))
+    req, err := http.NewRequestWithContext(ctx, "POST", "http://service-b:8081/cep", bytes.NewReader(reqBody))
     if err != nil {
+        log.Println("Error creating request to Service B:", err)
         http.Error(w, "internal error", http.StatusInternalServerError)
         return
     }
     req.Header.Set("Content-Type", "application/json")
-    req.Body = ioutil.NopCloser(r.Body)
     resp, err := client.Do(req)
     if err != nil {
+        log.Println("Error making request to Service B:", err)
         http.Error(w, "service unavailable", http.StatusServiceUnavailable)
         return
     }
     defer resp.Body.Close()
     w.WriteHeader(resp.StatusCode)
-    responseBody, _ := ioutil.ReadAll(resp.Body)
+    responseBody, _ := io.ReadAll(resp.Body)
     w.Write(responseBody)
 }
 

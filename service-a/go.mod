@@ -1,6 +1,6 @@
 module service-a
 
-go 1.23.2
+go 1.22
 
 require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.55.0
